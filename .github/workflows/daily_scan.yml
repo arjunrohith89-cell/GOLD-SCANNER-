@@ -1,0 +1,26 @@
+name: Gold USD Live Scanner
+
+on:
+  schedule:
+    - cron: '55 3 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libraries
+        run: pip install pandas requests
+
+      - name: Run Gold Scanner
+        run: python scanner.py
+        
