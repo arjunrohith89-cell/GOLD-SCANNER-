@@ -11,8 +11,10 @@ RR = 2                 # target = 2 x stop distance
 ATR_MULT_MAX = 3.0     # skip if stop is wider than 3 x ATR
 SESSION_START = 13 * 60 + 30   # 1:30 PM IST (London open)
 SESSION_END = 23 * 60 + 30     # 11:30 PM IST
-MAX_SIGNAL_AGE_MIN = 15        # ignore stale candles
+MAX_SIGNAL_AGE_MIN = 25        # ignore stale candles
 HEARTBEAT_HOURS = 2
+PATTERNS = "both"      # both / engulf / pin
+SPREAD = 0.30          # assumed cost in $ per oz (spread+commission)
 
 # Put these in environment variables, NOT in the code
 TG_TOKEN = os.getenv("TG_TOKEN", "")
@@ -75,6 +77,11 @@ def check_signal(df, i):
     hammer = body > 0 and lower >= 2 * body and upper <= body
     star = body > 0 and upper >= 2 * body and lower <= body
 
+    if PATTERNS == "engulf":
+        hammer = star = False
+    elif PATTERNS == "pin":
+        bull_engulf = bear_engulf = False
+
     side = None
     if up_trend and (bull_engulf or hammer) and c["low"] <= c["ema20"] + 0.2 * atr and c["rsi"] < 65:
         side = "BUY"
@@ -123,9 +130,9 @@ def fmt(s):
             f"Lots: {s['Lots']} | Risk: ${s['Risk']}")
 
 
-def backtest():
-    df = get_candles("30d")
-    trades, i = [], 55
+def run_backtest(df):
+    """Returns list of (win, r_after_costs)."""
+    out, i = [], 55
     while i < len(df) - 1:
         s = check_signal(df, i)
         if not s:
@@ -138,7 +145,7 @@ def backtest():
                 hit_sl, hit_tp = l <= s["SL"], h >= s["Target"]
             else:
                 hit_sl, hit_tp = h >= s["SL"], l <= s["Target"]
-            if hit_sl:            # if both hit in one candle, count as loss (conservative)
+            if hit_sl:            # both in one candle = loss (conservative)
                 result = -1
                 break
             if hit_tp:
@@ -146,14 +153,70 @@ def backtest():
                 break
             j += 1
         if result is not None:
-            trades.append(result)
+            risk = abs(s["Entry"] - s["SL"])
+            out.append((result > 0, result - SPREAD / risk))
         i = j + 1
-    if not trades:
+    return out
+
+
+def backtest():
+    t = run_backtest(get_candles("30d"))
+    if not t:
         print("No trades found")
         return
-    wins = sum(1 for t in trades if t > 0)
-    print(f"Trades: {len(trades)} | Wins: {wins} | Win rate: {wins / len(trades) * 100:.1f}%")
-    print(f"Net result: {sum(trades):+.1f} R (1R = your risk per trade)")
+    wins = sum(1 for w, _ in t if w)
+    print(f"Trades: {len(t)} | Wins: {wins} | Win rate: {wins / len(t) * 100:.1f}%")
+    print(f"Net after costs: {sum(r for _, r in t):+.1f} R")
+
+
+def show_signals(last_n=15):
+    """Prints recent signals with entry, SL, target and outcome."""
+    df = get_candles("30d")
+    rows, i = [], 55
+    while i < len(df) - 1:
+        s = check_signal(df, i)
+        if not s:
+            i += 1
+            continue
+        res, j = "OPEN", i + 1
+        while j < len(df) and j < i + 60:
+            h, l = df.at[j, "high"], df.at[j, "low"]
+            if s["Side"] == "BUY":
+                hit_sl, hit_tp = l <= s["SL"], h >= s["Target"]
+            else:
+                hit_sl, hit_tp = h >= s["SL"], l <= s["Target"]
+            if hit_sl:
+                res = "LOSS"
+                break
+            if hit_tp:
+                res = "WIN"
+                break
+            j += 1
+        rows.append((s, res))
+        i = j + 1
+    for s, res in rows[-last_n:]:
+        print(f"{s['ts']:%d-%b %H:%M} {s['Side']} {s['Pattern']}\n"
+              f"  Entry {s['Entry']} | SL {s['SL']} | TP {s['Target']} | {res}")
+
+
+def sweep():
+    global RR, PATTERNS, SESSION_START, SESSION_END
+    df = get_candles("30d")
+    sessions = {"London": (810, 1200), "NewYork": (1200, 1410), "Full": (810, 1410)}
+    rows = []
+    for rr in (1.5, 2, 3):
+        for pat in ("both", "engulf", "pin"):
+            for name, (a, b) in sessions.items():
+                RR, PATTERNS, SESSION_START, SESSION_END = rr, pat, a, b
+                t = run_backtest(df)
+                if len(t) < 10:
+                    continue
+                w = sum(1 for x, _ in t if x)
+                rows.append((sum(r for _, r in t), len(t), w / len(t) * 100, rr, pat, name))
+    rows.sort(reverse=True)
+    print("NetR | Trades | Win% | RR | Pattern | Session")
+    for net, n, wr, rr, pat, name in rows[:10]:
+        print(f"{net:+.1f} | {n} | {wr:.0f}% | {rr} | {pat} | {name}")
 
 
 def run_live():
@@ -204,8 +267,12 @@ def run_once():
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "backtest":
         backtest()
+    elif len(sys.argv) > 1 and sys.argv[1] == "show":
+        show_signals()
+    elif len(sys.argv) > 1 and sys.argv[1] == "sweep":
+        sweep()
     elif len(sys.argv) > 1 and sys.argv[1] == "once":
         run_once()
     else:
         run_live()
-    
+        
