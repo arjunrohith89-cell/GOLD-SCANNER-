@@ -1,135 +1,211 @@
-import io
+import os
+import sys
 import time
 import datetime as dt
 import requests
 import pandas as pd
 
-# ---------- SETTINGS ($5k FundingPips Account) ----------
-MAX_LOSS = 125       # Max risk limit for $5k account
-CAPITAL = 5000       # $5,000 account size
-RR = 2
-MAX_RISK_PCT = 1.0
-USE_VWAP_FILTER = True
-VOL_MULTIPLIER = 1.2
+# ---------- SETTINGS ----------
+RISK_USD = 50          # risk per trade (1% of $5k). Change as you like
+RR = 2                 # target = 2 x stop distance
+ATR_MULT_MAX = 3.0     # skip if stop is wider than 3 x ATR
+SESSION_START = 13 * 60 + 30   # 1:30 PM IST (London open)
+SESSION_END = 23 * 60 + 30     # 11:30 PM IST
+MAX_SIGNAL_AGE_MIN = 15        # ignore stale candles
+HEARTBEAT_HOURS = 2
 
-# Your Verified Telegram Credentials:
-TG_TOKEN = "8905260026:AAHXExujNUHsGbGbldHiEsGETsk-OMTXc0w"
-TG_CHAT_ID = "945498377"
-# --------------------------------------------------------
+# Put these in environment variables, NOT in the code
+TG_TOKEN = os.getenv("TG_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
+# ------------------------------
 
 SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"
-})
+SESSION.headers.update({"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36"})
 
-def get_ist_now():
-    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5, minutes=30)
 
-def get_gold_candles():
+def now_ist():
+    return (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+
+
+def get_candles(days="5d"):
     url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
-    resp = SESSION.get(url, params={"interval": "5m", "range": "2d"}, timeout=8)
-    result = resp.json().get("chart", {}).get("result")
-    if not result:
-        return pd.DataFrame()
-
-    res = result[0]
-    ts = res.get("timestamp", [])
-    quote = res.get("indicators", {}).get("quote", [{}])[0]
-    if not ts or not quote:
-        return pd.DataFrame()
-
+    r = SESSION.get(url, params={"interval": "5m", "range": days}, timeout=10)
+    res = r.json()["chart"]["result"][0]
+    q = res["indicators"]["quote"][0]
     df = pd.DataFrame({
-        "ts": pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None),
-        "open": quote.get("open"),
-        "high": quote.get("high"),
-        "low": quote.get("low"),
-        "close": quote.get("close"),
-        "volume": quote.get("volume"),
-    }).dropna()
+        "ts": pd.to_datetime(res["timestamp"], unit="s", utc=True)
+              .tz_convert("Asia/Kolkata").tz_localize(None),
+        "open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"],
+    }).dropna().reset_index(drop=True)
 
-    if df.empty:
-        return pd.DataFrame()
-
-    latest_day = df["ts"].dt.date.max()
-    df = df[df["ts"].dt.date == latest_day].copy().reset_index(drop=True)
-    
-    tp = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (tp * df["volume"]).cumsum() / df["volume"].replace(0, 1).cumsum()
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+    tr = pd.concat([df["high"] - df["low"],
+                    (df["high"] - df["close"].shift()).abs(),
+                    (df["low"] - df["close"].shift()).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    delta = df["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    df["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
     return df
 
-def evaluate_gold_signal(df):
-    if df.empty or len(df) < 4:
-        return None
-    
-    last = df.iloc[-1]
-    last_close, last_vwap, last_vol = float(last["close"]), float(last["vwap"]), float(last["volume"])
-    avg_vol = float(df["volume"].mean())
-    prev_close = float(df.iloc[-2]["close"])
-    
-    opening = df.head(3)
-    r_high, r_low = opening["high"].max(), opening["low"].min()
 
-    if last_close > r_high and prev_close <= r_high:
-        if USE_VWAP_FILTER and last_close < last_vwap:
-            return None
-        side, entry, sl = "BUY", r_high, r_low
-    elif last_close < r_low and prev_close >= r_low:
-        if USE_VWAP_FILTER and last_close > last_vwap:
-            return None
-        side, entry, sl = "SELL", r_low, r_high
-    else:
+def check_signal(df, i):
+    """Evaluate the CLOSED candle at index i. Returns dict or None."""
+    if i < 55:
+        return None
+    c, p = df.iloc[i], df.iloc[i - 1]
+    mins = c["ts"].hour * 60 + c["ts"].minute
+    if not (SESSION_START <= mins <= SESSION_END):
         return None
 
-    if VOL_MULTIPLIER > 0 and last_vol < (avg_vol * VOL_MULTIPLIER):
+    atr = c["atr"]
+    body = abs(c["close"] - c["open"])
+    upper = c["high"] - max(c["open"], c["close"])
+    lower = min(c["open"], c["close"]) - c["low"]
+
+    up_trend = c["ema20"] > c["ema50"] and c["close"] > c["ema50"]
+    dn_trend = c["ema20"] < c["ema50"] and c["close"] < c["ema50"]
+
+    bull_engulf = (p["close"] < p["open"] and c["close"] > c["open"]
+                   and c["close"] > p["open"] and c["open"] <= p["close"])
+    bear_engulf = (p["close"] > p["open"] and c["close"] < c["open"]
+                   and c["close"] < p["open"] and c["open"] >= p["close"])
+    hammer = body > 0 and lower >= 2 * body and upper <= body
+    star = body > 0 and upper >= 2 * body and lower <= body
+
+    side = None
+    if up_trend and (bull_engulf or hammer) and c["low"] <= c["ema20"] + 0.2 * atr and c["rsi"] < 65:
+        side = "BUY"
+        entry = c["close"]
+        sl = min(c["low"], p["low"]) - 0.1 * atr
+    elif dn_trend and (bear_engulf or star) and c["high"] >= c["ema20"] - 0.2 * atr and c["rsi"] > 35:
+        side = "SELL"
+        entry = c["close"]
+        sl = max(c["high"], p["high"]) + 0.1 * atr
+    if not side:
         return None
 
     risk = abs(entry - sl)
-    if risk == 0 or (risk / entry * 100) > MAX_RISK_PCT:
+    if risk < 0.5 * atr:
+        risk = 0.5 * atr
+        sl = entry - risk if side == "BUY" else entry + risk
+    if risk > ATR_MULT_MAX * atr:
         return None
 
-    qty = round(min(MAX_LOSS / risk, (CAPITAL * 0.02) / entry), 2)
-    if qty < 0.01:
-        qty = 0.01
-
     target = entry + RR * risk if side == "BUY" else entry - RR * risk
-    timestamp_str = last["ts"].strftime("%Y-%m-%d %H:%M")
-    
+    lots = max(0.01, round(RISK_USD / (risk * 100), 2))  # 1 lot = 100 oz
+    pattern = ("Engulfing" if (bull_engulf if side == "BUY" else bear_engulf)
+               else ("Hammer" if side == "BUY" else "Shooting Star"))
     return {
-        "ID": f"{timestamp_str}_{side}",
-        "Symbol": "GOLD (XAUUSD)", "Side": side, "Time": last["ts"].strftime("%H:%M"),
-        "Entry": round(entry, 2), "SL": round(sl, 2), "Target": round(target, 2),
-        "Qty": qty, "Risk": round(risk * qty, 2), "VWAP": round(last_vwap, 2)
+        "ID": f"{c['ts']:%Y-%m-%d %H:%M}_{side}", "Side": side, "Time": f"{c['ts']:%H:%M}",
+        "ts": c["ts"], "Entry": round(entry, 2), "SL": round(sl, 2), "Target": round(target, 2),
+        "Lots": lots, "Risk": round(risk * 100 * lots, 2), "Pattern": pattern,
     }
+
 
 def send_telegram(text):
     if not (TG_TOKEN and TG_CHAT_ID):
+        print("Telegram not configured:", text)
         return
     try:
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", data={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      data={"chat_id": TG_CHAT_ID, "text": text}, timeout=10)
     except Exception as e:
         print("Telegram error:", e)
 
+
 def fmt(s):
     icon = "🟢 GOLD BUY" if s["Side"] == "BUY" else "🔴 GOLD SELL"
-    return f"{icon} ({s['Time']})\nEntry: ${s['Entry']} | SL: ${s['SL']} | Target: ${s['Target']}\nLots: {s['Qty']} | Risk: ${s['Risk']}"
+    return (f"{icon} ({s['Time']} IST) - {s['Pattern']}\n"
+            f"Entry: ${s['Entry']}\nSL: ${s['SL']}\nTarget: ${s['Target']}\n"
+            f"Lots: {s['Lots']} | Risk: ${s['Risk']}")
+
+
+def backtest():
+    df = get_candles("30d")
+    trades, i = [], 55
+    while i < len(df) - 1:
+        s = check_signal(df, i)
+        if not s:
+            i += 1
+            continue
+        result, j = None, i + 1
+        while j < len(df) and j < i + 60:
+            h, l = df.at[j, "high"], df.at[j, "low"]
+            if s["Side"] == "BUY":
+                hit_sl, hit_tp = l <= s["SL"], h >= s["Target"]
+            else:
+                hit_sl, hit_tp = h >= s["SL"], l <= s["Target"]
+            if hit_sl:            # if both hit in one candle, count as loss (conservative)
+                result = -1
+                break
+            if hit_tp:
+                result = RR
+                break
+            j += 1
+        if result is not None:
+            trades.append(result)
+        i = j + 1
+    if not trades:
+        print("No trades found")
+        return
+    wins = sum(1 for t in trades if t > 0)
+    print(f"Trades: {len(trades)} | Wins: {wins} | Win rate: {wins / len(trades) * 100:.1f}%")
+    print(f"Net result: {sum(trades):+.1f} R (1R = your risk per trade)")
+
+
+def run_live():
+    send_telegram("🚀 Gold scanner started (EMA trend + candlestick patterns)")
+    notified, last_beat = set(), time.time()
+    while True:
+        try:
+            now = now_ist()
+            if now.weekday() < 5:
+                df = get_candles("5d")
+                s = check_signal(df, len(df) - 2)  # last CLOSED candle
+                if s and s["ID"] not in notified:
+                    age = (now - s["ts"]).total_seconds() / 60
+                    notified.add(s["ID"])
+                    if age <= MAX_SIGNAL_AGE_MIN:
+                        send_telegram(fmt(s))
+                        print(fmt(s))
+                if time.time() - last_beat > HEARTBEAT_HOURS * 3600:
+                    last_beat = time.time()
+                    send_telegram(f"✅ Scanner alive | Gold ${df.iloc[-1]['close']:.2f} | no new signal")
+            else:
+                time.sleep(300)
+        except Exception as e:
+            print("Loop error:", e)
+        time.sleep(60)
+
+
+STATE_FILE = "last_signal.txt"
+
+
+def run_once():
+    """One check, then exit. For GitHub Actions (runs every 5 min)."""
+    now = now_ist()
+    if now.weekday() >= 5:
+        return
+    df = get_candles("5d")
+    s = check_signal(df, len(df) - 2)  # last CLOSED candle
+    last_id = open(STATE_FILE).read().strip() if os.path.exists(STATE_FILE) else ""
+    if s and s["ID"] != last_id:
+        age = (now - s["ts"]).total_seconds() / 60
+        if age <= MAX_SIGNAL_AGE_MIN:
+            send_telegram(fmt(s))
+        with open(STATE_FILE, "w") as f:
+            f.write(s["ID"])
+    print(f"{now:%H:%M} checked | signal: {s['ID'] if s else 'none'}")
+
 
 if __name__ == "__main__":
-    send_telegram("🚀 Multi-Signal Gold Scanner Active ($5k FundingPips Account)")
-    notified_signals = set()
-
-    while True:
-        now_ist = get_ist_now()
-        if now_ist.weekday() >= 5:
-            time.sleep(300)
-            continue
-
-        df = get_gold_candles()
-        sig = evaluate_gold_signal(df)
-        
-        if sig and sig["ID"] not in notified_signals:
-            notified_signals.add(sig["ID"])
-            msg = fmt(sig)
-            print(msg)
-            send_telegram(msg)
-            
-        time.sleep(60)
+    if len(sys.argv) > 1 and sys.argv[1] == "backtest":
+        backtest()
+    elif len(sys.argv) > 1 and sys.argv[1] == "once":
+        run_once()
+    else:
+        run_live()
+    
