@@ -1,26 +1,39 @@
-name: Gold USD Live Scanner
+name: Gold Scanner
 
 on:
   schedule:
-    - cron: '55 3 * * 1-5'
+    - cron: "*/10 8-18 * * 1-5"
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gold-scanner
+  cancel-in-progress: true
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 3
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Install libraries
-        run: pip install pandas requests
-
-      - name: Run Gold Scanner
-        run: python scanner.py
-        
+          python-version: "3.11"
+          cache: pip
+      - run: pip install requests pandas
+      - name: Run scanner
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python scanner.py once
+      - name: Save last signal
+        continue-on-error: true
+        run: |
+          if [ -f last_signal.txt ]; then
+            git config user.name "bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add last_signal.txt
+            git diff --staged --quiet || (git commit -m "update last signal" && git push)
+          fi
